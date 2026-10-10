@@ -1,0 +1,41 @@
+{
+  "name": "pi-context-manager",
+  "version": "0.1.0",
+  "description": "pi extension — context visibility and guarded active context management: context_status, context_compact, context_prune",
+  "keywords": [
+    "pi-package",
+    "pi-extension",
+    "pi-tool",
+    "context",
+    "compaction",
+    "context-manager"
+  ],
+  "author": "Traveler0014",
+  "license": "MIT",
+  "type": "module",
+  "repository": "git@github.com:Traveler0014/pi-context-manager.git",
+  "installUrl": "https://github.com/Traveler0014/pi-context-manager.git",
+  "scripts": {
+    "update-docs": "tsx scripts/update-docs.ts",
+    "test": "vitest run",
+    "typecheck": "tsc --noEmit",
+    "release": "bash scripts/release.sh"
+  },
+  "pi": {
+    "extensions": [
+      "tools/context-manager"
+    ]
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "*",
+    "typebox": "*"
+  },
+  "devDependencies": {
+    "@earendil-works/pi-coding-agent": "^0.80.0",
+    "@types/node": "^24.0.0",
+    "tsx": "^4.22.4",
+    "typebox": "*",
+    "typescript": "^5.9.2",
+    "vitest": "^4.1.9"
+  }
+}

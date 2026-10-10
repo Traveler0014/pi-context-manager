@@ -1,0 +1,33 @@
+{
+  "name": "context-manager",
+  "version": "0.1.0",
+  "description": "Context visibility + guarded active management for pi — status boot line, context_status / context_compact / context_prune tools, /context-manager command",
+  "keywords": [
+    "pi-package",
+    "pi-extension",
+    "pi-tool",
+    "context",
+    "compaction"
+  ],
+  "license": "MIT",
+  "type": "module",
+  "pi": {
+    "extensions": [
+      "./index.ts"
+    ],
+    "contextBudget": "~450 tokens (1 static boot line + 3 tool declarations)"
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "*",
+    "typebox": "*"
+  },
+  "scripts": {
+    "check": "tsc -p tsconfig.json --noEmit"
+  },
+  "devDependencies": {
+    "@earendil-works/pi-coding-agent": "^0.80.0",
+    "@types/node": "^24.0.0",
+    "tsx": "^4.22.4",
+    "typescript": "^5.9.2"
+  }
+}
