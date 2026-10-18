@@ -63,15 +63,20 @@ Compaction completed: 977K → 66K. Prior context is now a lossy summary; durabl
   - **冷却期**：距上次压缩 < 10 分钟拒绝（可配）
   - **低收益拒绝**：真实占用 < 50% 时拒绝并回真实用量
   - **缓存教导**：description 写明"仅在任务边界调用；每次压缩 = 一次缓存失效"
-- 执行：调用 `ctx.compact({ customInstructions, onComplete, onError })`，**fire-and-forget 调度**：工具立即返回
-  "Compaction scheduled"，压缩在当前回合 settle 后执行（新窗口），完成/失败通过 `session_compact` 破锚消息与 TUI 通知回报
+- 执行：工具只做护栏校验并把请求**入队**（`state.queuedCompact`），立即返回 "Compaction queued"。
+  真正的 `ctx.compact({ customInstructions, onComplete, onError })` 由 `agent_settled` 处理器在
+  **当前 run 完全 settle 之后**发起（此时 `abort()` 是 no-op），完成/失败通过 `session_compact` 破锚消息与 TUI 通知回报
+- **不打断回合**：pi 的 manual `compact()` 首行是 `await abort()`；若在工具 `execute()` 里调用，会立刻中断当前 run，
+  且 agent loop 在 signal aborted 后直接 break——同一批里排在后面的 tool call 会被**静默丢弃**（实测）。
+  因此工具永不直接调用 `ctx.compact()`；请求随 run 结束自然生效；若该 run 被用户 abort，排队请求会被丢弃并提示
+- 模型调用后应继续/结束当前批次；重复请求（同一 run 内第二次）会被拒绝，避免排队期间叠加
 
 > 实现注记（`ctx.isIdle`）：pi 的 `isIdle = !isAgentRunActive && !isCompacting`，而工具必然运行在 agent run 内部，
-> 因此工具执行期 `ctx.isIdle()` 恒为 false。此处改用等效护栏：`state.compacting` 在途标记 + 顺序执行。
+> 因此工具执行期 `ctx.isIdle()` 恒为 false。此处改用等效护栏：`state.compacting` 在途标记 + 顺序执行 + 入队去重。
 >
-> 实现注记（死锁规避）：pi 的 `ctx.compact()` 内部 `await abort() → waitForIdle()`。若在工具 `execute()` 中 `await` 它，
-> 会形成死锁（run 等工具、`waitForIdle` 等 run）。因此本扩展只在工具里**发起**压缩、立即返回：请求会触发 abort，
-> run 结束后 idle 条件满足，摘要器再运行。这是工具形态下唯一可行的调用方式。
+> 实现注记（为何必须在 `agent_settled`）：工具里 `await ctx.compact()` 会死锁（run 等工具、`waitForIdle` 等 run）；
+> fire-and-forget 虽绕过死锁，但 abort 仍会打断回合。`agent_settled` 是首个 `_isAgentRunActive === false` 的时刻，
+> `ctx.compact()` 内部的 abort 变成 no-op，因此这是工具形态下唯一既不打断回合也不丢调用的调用点。
 
 ### C. `context_prune`（定向删除，中风险）
 

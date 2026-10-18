@@ -110,6 +110,11 @@ export function buildStatusReport(
   if (state.pendingPrune.length > 0) {
     lines.push(`Pending at next boundary: ${state.pendingPrune.map((r) => r.ref).join(' ')}`);
   }
+  if (state.queuedCompact) {
+    lines.push(
+      `Compaction: queued at ${formatClock(state.queuedCompact.requestedAt)} — runs when the current run settles`,
+    );
+  }
 
   lines.push(
     `Guards: compact ≥${state.config.lowYieldPercent}% · cooldown ${state.config.compactCooldownMinutes}m`,
@@ -282,18 +287,20 @@ export function registerContextManagerTools(
     name: 'context_compact',
     label: 'Compact Context',
     description:
-      'Schedule a compaction that replaces older conversation context with a summary, starting a new ' +
-      'context window. It runs as soon as the current turn settles. CALL ONLY AT A TASK BOUNDARY — after ' +
-      'a batch of work or a delivered report, never mid-task, and never twice in a row: every compaction ' +
-      'invalidates the prompt cache, which is expensive on this provider. Enforced guards: refuses when ' +
-      'real usage is below the low-yield threshold (default 50%, returns the real usage so you can ' +
-      'recalibrate), refuses within the cooldown after the last compaction (default 10 min), and refuses ' +
-      'a keep-list larger than 5% of the context window. Keep-list entries are passed to the summarizer ' +
-      'verbatim.',
+      'Queue a compaction that replaces older conversation context with a summary, starting a new context ' +
+      'window. The request is queued and runs only after the current run has fully settled (the agent goes ' +
+      'idle), so it never aborts or interrupts the turn and never drops tool calls. CALL ONLY AT A TASK ' +
+      'BOUNDARY — after a batch of work or a delivered report, never mid-task, and never twice in a row: ' +
+      'every compaction invalidates the prompt cache, which is expensive on this provider. Enforced ' +
+      'guards: refuses when real usage is below the low-yield threshold (default 50%, returns the real ' +
+      'usage so you can recalibrate), refuses within the cooldown after the last compaction (default ' +
+      '10 min), refuses a second request before the queued one runs, and refuses a keep-list larger than ' +
+      '5% of the context window. Keep-list entries are passed to the summarizer verbatim.',
     promptSnippet: 'context_compact(instructions?, keep?) — guarded proactive compaction at task boundaries',
     promptGuidelines: [
       'Call context_compact only after finishing a coherent batch of work, never in the middle of a task.',
-      'Each compaction invalidates the prompt cache; do not call it repeatedly.',
+      'The request is queued and runs when this run settles; finish the current batch after calling it.',
+      'Each compaction invalidates the prompt cache; do not call it repeatedly or again in the same run.',
       'Use the keep parameter for facts that must survive verbatim (decisions, rejected paths, exact commands).',
       'If refused for low usage, trust the returned real usage instead of guessing.',
     ],
@@ -320,6 +327,13 @@ export function registerContextManagerTools(
       if (state.compacting) {
         return fail(
           'A compaction is already in progress. Wait for idle before requesting another.',
+        );
+      }
+
+      if (state.queuedCompact) {
+        return fail(
+          'A compaction is already queued for this run. It runs when the run settles; finish the current ' +
+          'batch instead of requesting another one.',
         );
       }
 
@@ -375,50 +389,18 @@ export function registerContextManagerTools(
           keep.map((s, i) => `${i + 1}. ${s}`).join('\n');
       }
 
-      // `ctx.compact()` internally awaits `abort()` → `waitForIdle()`. Calling it
-      // synchronously from inside a tool would deadlock: the run is waiting on
-      // this tool, and idle-wait waits for the run. So schedule it
-      // fire-and-forget — the request aborts the current run, and once the run
-      // settles the summarizer runs. Completion updates the ledger/UI.
-      state.compacting = true;
-      state.pendingCompact = true;
-      const ui = ctx.ui;
-      const notify = (message: string, level: 'info' | 'warning' | 'error'): void => {
-        try {
-          ui.notify(message, level);
-        } catch {
-          /* UI may be gone after the run settles */
-        }
-      };
-      const request = ctx.compact({
-        customInstructions: customInstructions || undefined,
-        onComplete: (result) => {
-          state.compacting = false;
-          state.pendingCompact = false;
-          state.lastCompactAt = Date.now();
-          state.lastCompactError = undefined;
-          notify(
-            `context-manager: compaction complete — ${formatTokens(result.tokensBefore)} of prior context summarized.`,
-            'info',
-          );
-        },
-        onError: (err) => {
-          state.compacting = false;
-          state.pendingCompact = false;
-          state.lastCompactError = err.message;
-          notify(`context-manager: compaction failed — ${err.message}`, 'warning');
-        },
-      });
-      // Failure is already surfaced via onError / session_compact_failed; the
-      // returned promise also rejects on failure — swallow it so a rejected
-      // fire-and-forget request never becomes an unhandled rejection.
-      Promise.resolve(request).catch(() => {});
+      // Do NOT call `ctx.compact()` here: pi's manual compaction starts with
+      // `await abort()`, which kills the active run and silently drops every
+      // tool call after this one in the batch. Queue the request instead; the
+      // `agent_settled` handler performs the compaction once the run is idle.
+      state.queueCompaction(customInstructions || undefined);
 
       return ok(
-        'Compaction scheduled: it runs as soon as this turn settles, starting a new context window. ' +
-          'Do not call context_compact again this turn — finish the current batch. The post-compaction ' +
-          'usage is reported in the anchor-break message and by context_status.',
-        { scheduled: true, hasInstructions: customInstructions.length > 0, keepCount: keep.length },
+        'Compaction queued: it runs as soon as this run settles (the agent goes idle), starting a new ' +
+          'context window. It does not interrupt the current turn. Do not call context_compact again this ' +
+          'run — finish the current batch. The post-compaction usage is reported in the anchor-break ' +
+          'message and by context_status.',
+        { queued: true, hasInstructions: customInstructions.length > 0, keepCount: keep.length },
       );
     },
   });

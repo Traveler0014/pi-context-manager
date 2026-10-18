@@ -291,6 +291,98 @@ export default function contextManager(pi: ExtensionAPI) {
 
   looseApi.on('agent_before_settle', async (_event: any, ctx: any) => boundaryFlush(ctx));
 
+  // ── deferred compaction (model-requested, executed once idle) ────────────
+
+  /**
+   * Perform a queued `context_compact` request after the run has fully settled.
+   *
+   * pi's manual `compact()` starts with `await abort()`, which aborts the active
+   * run and silently drops every tool call after the requesting one in the same
+   * batch. `agent_settled` is the first moment where no run is active, so the
+   * abort inside `compact()` is a no-op and the turn is never interrupted.
+   */
+  const isTui = (ctx: ExtensionContext): boolean => {
+    try {
+      return ctx.mode === 'tui';
+    } catch {
+      // The runner invalidates its ctx during shutdown; never let that throw.
+      return false;
+    }
+  };
+
+  const runQueuedCompaction = (ctx: ExtensionContext): Promise<void> => {
+    if (!state.queuedCompact) return Promise.resolve();
+    if (!state.config.enabled) {
+      state.clearQueuedCompaction();
+      return Promise.resolve();
+    }
+    if (state.compacting) return Promise.resolve();
+
+    const request = state.takeQueuedCompaction();
+    if (!request) return Promise.resolve();
+
+    state.compacting = true;
+    state.pendingCompact = true;
+    const ui = ctx.ui;
+    const notify = (message: string, level: 'info' | 'warning' | 'error'): void => {
+      try {
+        ui.notify(message, level);
+      } catch {
+        /* UI may be gone after the run settles */
+      }
+    };
+
+    return new Promise<void>((resolve) => {
+      let pending: void | Promise<unknown>;
+      try {
+        pending = ctx.compact({
+          customInstructions: request.instructions,
+          onComplete: (result) => {
+            state.compacting = false;
+            state.pendingCompact = false;
+            state.lastCompactAt = Date.now();
+            state.lastCompactError = undefined;
+            notify(
+              `context-manager: compaction complete — ${formatTokens(result.tokensBefore)} of prior context summarized.`,
+              'info',
+            );
+            resolve();
+          },
+          onError: (err) => {
+            state.compacting = false;
+            state.pendingCompact = false;
+            state.lastCompactError = err.message;
+            notify(`context-manager: compaction failed — ${err.message}`, 'warning');
+            resolve();
+          },
+        });
+      } catch (err) {
+        state.compacting = false;
+        state.pendingCompact = false;
+        state.lastCompactError = err instanceof Error ? err.message : String(err);
+        resolve();
+        return;
+      }
+      // Failure is already surfaced via onError / session_compact_failed; swallow
+      // the rejected fire-and-forget request so it never becomes unhandled.
+      Promise.resolve(pending).catch(() => resolve());
+    });
+  };
+
+  looseApi.on('agent_settled', async (event: any, ctx: any) => {
+    if (!state.queuedCompact) return;
+    if (event?.aborted) {
+      state.clearQueuedCompaction();
+      if (isTui(ctx)) {
+        ctx.ui.notify('context-manager: queued compaction dropped (run was aborted).', 'warning');
+      }
+      return;
+    }
+    // Awaiting keeps the run settling (and the process alive in print mode)
+    // until the summarizer finishes; `compact()`'s internal abort is a no-op here.
+    await runQueuedCompaction(ctx);
+  });
+
   pi.on('session_before_compact', async (_event, ctx) => {
     if (!state.config.enabled || !state.pendingCompact) return undefined;
     const usage = ctx.getContextUsage();
@@ -337,12 +429,13 @@ export default function contextManager(pi: ExtensionAPI) {
     state.pendingCompact = false;
     state.compacting = false;
     state.lastCompactError = event.errorMessage ?? (event.aborted ? 'aborted or cancelled' : 'unknown');
-    if (ctx.mode === 'tui' && event.errorMessage) {
+    if (isTui(ctx) && event.errorMessage) {
       ctx.ui.notify(`Compaction failed: ${event.errorMessage}`, 'warning');
     }
   });
 
   pi.on('session_shutdown', async (_event, ctx) => {
+    state.clearQueuedCompaction();
     if (ctx.mode === 'tui') ctx.ui.setStatus(STATUS_KEY, undefined);
   });
 

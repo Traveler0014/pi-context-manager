@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest';
-import { deriveCompactionInfo, type SessionEntryLike } from './state.js';
+import { DEFAULT_CONFIG } from './config.js';
+import { ContextManagerState, deriveCompactionInfo, type SessionEntryLike } from './state.js';
 
 function entry(partial: Partial<SessionEntryLike>): SessionEntryLike {
   return { type: 'message', id: partial.id ?? 'e', ...partial };
@@ -65,5 +66,50 @@ describe('deriveCompactionInfo', () => {
     expect(info.count).toBe(1);
     expect(info.lastAt).toBeUndefined();
     expect(info.lastTokensBefore).toBeUndefined();
+  });
+});
+
+describe('queued compaction', () => {
+  const newState = (): ContextManagerState => new ContextManagerState({ ...DEFAULT_CONFIG });
+
+  it('takes the queued request exactly once', () => {
+    const state = newState();
+    state.queueCompaction('focus on the migration');
+    const request = state.takeQueuedCompaction();
+    expect(request?.instructions).toBe('focus on the migration');
+    expect(state.queuedCompact).toBeUndefined();
+    expect(state.takeQueuedCompaction()).toBeUndefined();
+  });
+
+  it('keeps the last request when queued twice', () => {
+    const state = newState();
+    state.queueCompaction('first');
+    state.queueCompaction('second');
+    expect(state.queuedCompact?.instructions).toBe('second');
+  });
+
+  it('clears the queue when cleared explicitly', () => {
+    const state = newState();
+    state.queueCompaction();
+    state.clearQueuedCompaction();
+    expect(state.queuedCompact).toBeUndefined();
+  });
+
+  it('clears the queue and in-flight flags when a compaction completes', () => {
+    const state = newState();
+    state.queueCompaction('x');
+    state.compacting = true;
+    state.pendingCompact = true;
+    state.onCompacted(Date.now());
+    expect(state.queuedCompact).toBeUndefined();
+    expect(state.compacting).toBe(false);
+    expect(state.pendingCompact).toBe(false);
+  });
+
+  it('drops a stale queue when state is rebuilt from the branch', () => {
+    const state = newState();
+    state.queueCompaction('x');
+    state.rebuildFromBranch([]);
+    expect(state.queuedCompact).toBeUndefined();
   });
 });

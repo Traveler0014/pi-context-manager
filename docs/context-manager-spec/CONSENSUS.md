@@ -78,11 +78,14 @@ Compaction completed: 977K → 66K. Prior context is now a lossy summary; durabl
   - **冷却期**：距上次压缩 < 10 分钟拒绝（可配置）
   - **低收益拒绝**：真实占用 < 50% 时拒绝并回当前真实用量
   - **教导式 description**：写明"仅在任务边界（一批工作完成、报告已交付后）调用；勿连续调用；每次压缩 = 一次缓存失效"
-- 执行：调用 `ctx.compact({ customInstructions, onComplete })`；`onComplete` 把压缩后用量回给模型（工具结果里）
-  > **实现修订（已实测）**：pi 的 `ctx.compact()` 内部 `await abort() → waitForIdle()`，而工具 `execute()` 运行在 agent run 内部。
-  > 若在工具里 `await` 压缩会**死锁**（run 等工具、`waitForIdle` 等 run）。改为：工具仅校验护栏并**发起**压缩后立即返回
-  > "Compaction scheduled"，压缩在当前回合 settle 后执行；完成/失败由 `session_compact` / `session_compact_failed`
-  > 与锚定消息回报（已用 TUI 实测：压实→ `[compaction]` 条目 → `[context-manager] Compaction completed: 11K → recalculating`）。
+- 执行：工具只做护栏校验并**入队**（`state.queuedCompact`）；真正的 `ctx.compact({ customInstructions, onComplete })` 由
+  `agent_settled` 处理器在当前 run 完全 settle 后发起，完成/失败由 `session_compact` / `session_compact_failed` 与锚定消息回报
+  > **实现修订 v2（已实测，取代 fire-and-forget）**：pi 的 `ctx.compact()` 首行是 `await abort()`。从工具 `execute()` 里调用它，
+  > 即使不 await，abort 也已同步生效：当前 run 被中断，agent loop 在 `signal.aborted` 后直接 break——同一批中排在后面的
+  > tool call 被**静默丢弃**（无 toolResult），并多出一条 `stopReason=error` 的 aborted assistant 消息；若压缩随后失败
+  > （如 "Nothing to compact"），中断已经发生且不可撤销。因此改为**排队 + 延迟执行**：`agent_settled` 是首个
+  > `_isAgentRunActive === false` 的时刻，此处的 `ctx.compact()` 内部 abort 为 no-op，既不打断回合也不丢调用。
+  > 若 run 被用户 abort，则丢弃排队请求并提示；同一 run 内重复请求被拒绝。
 
 ### C. `context_prune` 工具（定向删除，中风险带护栏）
 

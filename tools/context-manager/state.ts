@@ -32,6 +32,14 @@ export interface PruneBatch {
   records: PruneRecord[];
 }
 
+/** A compaction requested by the model, waiting for the agent to settle. */
+export interface PendingCompactRequest {
+  /** Focus passed to the summarizer (already merged with the keep-list). */
+  instructions?: string;
+  /** When the model asked (for diagnostics / status). */
+  requestedAt: number;
+}
+
 /** Minimal structural view of a session entry; avoids importing internal types. */
 export interface SessionEntryLike {
   type: string;
@@ -92,6 +100,12 @@ export class ContextManagerState {
   compacting = false;
   /** Set while a tool-initiated compaction awaits session_before_compact (last-defense guard). */
   pendingCompact = false;
+  /**
+   * Compaction requested by `context_compact`, executed by the `agent_settled`
+   * handler once the run has fully settled. Never executed from inside a tool:
+   * pi's manual compaction aborts the active run first.
+   */
+  queuedCompact: PendingCompactRequest | undefined;
 
   /** Last compaction timestamp as observed via events (fallback for cooldown). */
   lastCompactAt: number | undefined;
@@ -118,6 +132,23 @@ export class ContextManagerState {
     }
   }
 
+  /** Record a model-requested compaction; the last request wins. */
+  queueCompaction(instructions?: string): void {
+    this.queuedCompact = { instructions, requestedAt: Date.now() };
+  }
+
+  /** Drop a queued request (aborted run, disabled extension, or after it ran). */
+  clearQueuedCompaction(): void {
+    this.queuedCompact = undefined;
+  }
+
+  /** Take the queued request, clearing it (the caller performs the compaction). */
+  takeQueuedCompaction(): PendingCompactRequest | undefined {
+    const request = this.queuedCompact;
+    this.queuedCompact = undefined;
+    return request;
+  }
+
   /** Clear pending prune selections (after they have been emitted at a boundary). */
   drainPendingPrune(): PruneRecord[] {
     const drained = this.pendingPrune;
@@ -132,6 +163,7 @@ export class ContextManagerState {
     this.lastCompactError = undefined;
     this.pendingCompact = false;
     this.compacting = false;
+    this.queuedCompact = undefined;
   }
 
   /** Rebuild persisted state from the session branch (called on session_start). */
@@ -139,6 +171,7 @@ export class ContextManagerState {
     this.pruneRecords = [];
     this.pruneByEntry.clear();
     this.pendingPrune = [];
+    this.queuedCompact = undefined;
     this.refCounter = 0;
     this.lastPruneAt = undefined;
 
