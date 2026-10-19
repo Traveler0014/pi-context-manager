@@ -11,9 +11,12 @@ export function formatTokens(n: number | null | undefined): string {
     const v = n / 1_000_000;
     return `${trimFixed(v, v >= 10 ? 0 : 1)}M`;
   }
+  // Round up to M just below the boundary: 999_999 / 1000 = 999.999 → "1000K"
+  // would be wrong (and reads worse than "1M").
+  if (n >= 999_500) return `${trimFixed(n / 1_000_000, 1)}M`;
   if (n >= 1_000) {
     const v = n / 1_000;
-    return `${trimFixed(v, v >= 100 ? 0 : v >= 10 ? 0 : 1)}K`;
+    return `${trimFixed(v, v >= 10 ? 0 : 1)}K`;
   }
   return String(Math.round(n));
 }

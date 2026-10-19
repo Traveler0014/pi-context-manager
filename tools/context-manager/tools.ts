@@ -31,6 +31,12 @@ export interface ToolDeps {
   state: ContextManagerState;
   /** True when pi-context-prune (or a compatible pruner) is active; context_prune then yields. */
   isPruneExtensionActive: () => boolean;
+  /**
+   * Optional: re-run pruner detection for a cwd. The load-time detection only
+   * sees extensions that happen to be loaded already, so the tool refreshes it
+   * before reporting status.
+   */
+  refreshPruneDetection?: (cwd: string) => void;
 }
 
 // ExtensionToolContext (pi 1.1+) extends ExtensionContext; the older bundled dev
@@ -276,6 +282,7 @@ export function registerContextManagerTools(
     promptSnippet: 'Exact context usage + countdown to soft-limit + ledger',
     parameters: Type.Object({}),
     async execute(_id, _params, _signal, _onUpdate, ctx) {
+      deps.refreshPruneDetection?.(ctx.cwd);
       return ok(buildStatusReport(ctx, deps, getConfigPath()), {
         enabled: state.config.enabled,
       });
@@ -324,7 +331,7 @@ export function registerContextManagerTools(
       const config = state.config;
       if (!config.enabled) return fail('context-manager is disabled.');
 
-      if (state.compacting) {
+      if (state.isCompacting()) {
         return fail(
           'A compaction is already in progress. Wait for idle before requesting another.',
         );
@@ -405,174 +412,174 @@ export function registerContextManagerTools(
     },
   });
 
-  // ── context_prune (withdrawn when a compatible pruner is active) ─────────
-  if (!deps.isPruneExtensionActive()) {
-    pi.registerTool({
-      name: 'context_prune',
-      label: 'Prune Context',
-      description:
-        'Remove old, already-externalized tool results from future context to free space (the raw ' +
-        'history is preserved on disk). Requirements, all enforced: (1) externalizedTo is REQUIRED — ' +
-        'the file where you saved the original full outputs; (2) only tool results older than the most ' +
-        'recent compaction boundary are eligible; (3) per-call quota and a cooldown between batches; ' +
-        '(4) every pruned result gets a short recall ref printed so you can read the original later. ' +
-        'Use dryRun first to list candidates. Removal is applied at the next turn boundary. Do not ' +
-        'prune results you still need verbatim.',
-      promptSnippet: 'context_prune(externalizedTo, targets?, dryRun?) — quarantine stale tool results',
-      promptGuidelines: [
-        'Externalize the original output to a file before calling context_prune; externalizedTo is mandatory.',
-        'Prune only stale, large tool results you are unlikely to need verbatim again.',
-        'Use dryRun to inspect candidates before committing.',
-      ],
-      parameters: Type.Object({
-        externalizedTo: Type.String({
-          description:
-            'REQUIRED. Path of the file where the original full outputs were saved (kept for recall).',
-        }),
-        targets: Type.Optional(
-          Type.Array(Type.String(), {
-            description:
-              'Session entry ids of the tool results to prune. Omit to auto-select the largest eligible candidates.',
-          }),
-        ),
-        toolName: Type.Optional(
-          Type.String({ description: 'Only consider results produced by this tool.' }),
-        ),
-        minChars: Type.Optional(
-          Type.Number({ description: 'Minimum result size in characters (default 8000).' }),
-        ),
-        limit: Type.Optional(
-          Type.Number({ description: 'Maximum results to prune this call (capped by the quota).' }),
-        ),
-        dryRun: Type.Optional(
-          Type.Boolean({ description: 'List candidates without pruning anything.' }),
-        ),
+  // ── context_prune (yields to a compatible pruner at runtime) ─────────────
+  // Registered unconditionally: load-time detection races with the other
+  // extension's load order, so the runtime check in execute() decides.
+  pi.registerTool({
+    name: 'context_prune',
+    label: 'Prune Context',
+    description:
+      'Remove old, already-externalized tool results from future context to free space (the raw ' +
+      'history is preserved on disk). Requirements, all enforced: (1) externalizedTo is REQUIRED — ' +
+      'the file where you saved the original full outputs; (2) only tool results older than the most ' +
+      'recent compaction boundary are eligible; (3) per-call quota and a cooldown between batches; ' +
+      '(4) every pruned result gets a short recall ref printed so you can read the original later. ' +
+      'Use dryRun first to list candidates. Removal is applied at the next turn boundary. Do not ' +
+      'prune results you still need verbatim.',
+    promptSnippet: 'context_prune(externalizedTo, targets?, dryRun?) — quarantine stale tool results',
+    promptGuidelines: [
+      'Externalize the original output to a file before calling context_prune; externalizedTo is mandatory.',
+      'Prune only stale, large tool results you are unlikely to need verbatim again.',
+      'Use dryRun to inspect candidates before committing.',
+    ],
+    parameters: Type.Object({
+      externalizedTo: Type.String({
+        description:
+          'REQUIRED. Path of the file where the original full outputs were saved (kept for recall).',
       }),
-      async execute(_id, params, _signal, _onUpdate, ctx) {
-        const config = state.config;
-        if (!config.enabled) return fail('context-manager is disabled.');
-        if (!config.pruneEnabled) return fail('context_prune is disabled in the context-manager config.');
-        if (deps.isPruneExtensionActive()) {
-          return fail(
-            'pi-context-prune is active; context_prune is yielding to it to avoid double pruning. ' +
-              'Use context_tree_query to recall pruned originals.',
-          );
-        }
-
-        const externalizedTo = (params.externalizedTo ?? '').trim();
-        if (!externalizedTo) {
-          return fail(
-            'externalizedTo is required: give the path where the original full outputs were saved ' +
-              '(this becomes part of the prune ledger and the recall ref).',
-          );
-        }
-        if (config.pruneRequireExistingFile && !existsSync(externalizedTo)) {
-          return fail(
-            `externalizedTo file not found: ${externalizedTo}. Write the original outputs there first, ` +
-              `then retry — a prune without a durable copy is not recoverable.`,
-          );
-        }
-
-        const now = Date.now();
-        const cooldownMs = config.pruneCooldownMinutes * 60_000;
-        if (
-          cooldownMs > 0 &&
-          state.lastPruneAt !== undefined &&
-          now - state.lastPruneAt < cooldownMs
-        ) {
-          const waitMin = Math.ceil((cooldownMs - (now - state.lastPruneAt)) / 60_000);
-          return fail(
-            `Prune cooldown: the last prune batch was ${formatClock(state.lastPruneAt)}. ` +
-              `Wait about ${waitMin} more minute(s).`,
-          );
-        }
-
-        const minChars = Math.max(0, Math.floor(params.minChars ?? config.pruneMinChars));
-        const quota = Math.max(1, Math.floor(config.pruneQuota));
-        const limit = Math.max(1, Math.min(quota, Math.floor(params.limit ?? quota)));
-
-        const allCandidates = selectCandidates(ctx, deps, _id, {
-          toolName: params.toolName,
-          minChars,
-        });
-
-        if (allCandidates.length === 0) {
-          return ok(
-            'No eligible tool results to prune: none older than the last compaction boundary meet the ' +
-              `size/age criteria (minChars ${minChars}).`,
-            { candidates: 0 },
-          );
-        }
-
-        if (params.targets && params.targets.length === 0) {
-          return ok(
-            'targets is an empty list — nothing selected. Omit targets entirely to auto-select ' +
-              'the largest eligible candidates, or pass entry ids from a dryRun listing.',
-            { selected: 0 },
-          );
-        }
-
-        let chosen = allCandidates.slice(0, limit);
-        if (params.targets && params.targets.length > 0) {
-          const byId = new Map(allCandidates.map((c) => [c.entryId, c]));
-          const selected: PruneCandidate[] = [];
-          const rejected: string[] = [];
-          for (const target of params.targets) {
-            const candidate = byId.get(target);
-            if (candidate) selected.push(candidate);
-            else rejected.push(target);
-          }
-          if (rejected.length > 0) {
-            return fail(
-              `Some targets are not eligible (unknown, too small, too recent, or already pruned): ` +
-                `${rejected.join(', ')}. Run context_prune with dryRun to list eligible entry ids.`,
-              { rejected },
-            );
-          }
-          chosen = selected.slice(0, limit);
-        }
-        const truncated = params.targets !== undefined && params.targets.length > chosen.length;
-
-        if (params.dryRun) {
-          const lines = chosen.map(
-            (c) => `- ${c.entryId} · ${formatTokens(c.chars / 4)} tokens (~${c.chars} chars) · ${c.toolName ?? 'tool'}`,
-          );
-          return ok(
-            `Dry run: ${chosen.length} eligible candidate(s), largest first:\n${lines.join('\n')}\n` +
-              (truncated
-                ? `Quota is ${quota} per call — ${params.targets?.length ?? limit} requested; the remainder stay for a later batch.\n`
-                : '') +
-              'Externalize them, then call context_prune with externalizedTo and optionally these entry ids.',
-            { dryRun: true, candidates: chosen.map((c) => ({ entryId: c.entryId, chars: c.chars })) },
-          );
-        }
-
-        const records: PruneRecord[] = chosen.map((c) => ({
-          ref: state.nextRef(),
-          entryId: c.entryId,
-          externalizedTo,
-          chars: c.chars,
-          toolName: c.toolName,
-        }));
-        state.addPruneRecords(records);
-        state.pendingPrune.push(...records);
-        state.lastPruneAt = now;
-
-        const refs = records.map((r) => r.ref).join(' ');
-        return ok(
-          `Scheduled ${records.length} tool result(s) for removal at the next turn boundary ` +
-            `(freed ~${formatTokens(records.reduce((s, r) => s + r.chars, 0) / 4)} tokens). ` +
-            (truncated
-              ? `Quota is ${quota} per call — the remaining ${params.targets!.length - records.length} eligible target(s) were NOT pruned; call again after the cooldown. `
-              : '') +
-            `Recall refs: ${refs} → ${externalizedTo}. Read that file if you need the originals.`,
-          {
-            pruned: records.map((r) => ({ ref: r.ref, entryId: r.entryId, chars: r.chars })),
-            externalizedTo,
-            truncated,
-          },
+      targets: Type.Optional(
+        Type.Array(Type.String(), {
+          description:
+            'Session entry ids of the tool results to prune. Omit to auto-select the largest eligible candidates.',
+        }),
+      ),
+      toolName: Type.Optional(
+        Type.String({ description: 'Only consider results produced by this tool.' }),
+      ),
+      minChars: Type.Optional(
+        Type.Number({ description: 'Minimum result size in characters (default 8000).' }),
+      ),
+      limit: Type.Optional(
+        Type.Number({ description: 'Maximum results to prune this call (capped by the quota).' }),
+      ),
+      dryRun: Type.Optional(
+        Type.Boolean({ description: 'List candidates without pruning anything.' }),
+      ),
+    }),
+    async execute(_id, params, _signal, _onUpdate, ctx) {
+      const config = state.config;
+      if (!config.enabled) return fail('context-manager is disabled.');
+      if (!config.pruneEnabled) return fail('context_prune is disabled in the context-manager config.');
+      if (deps.isPruneExtensionActive()) {
+        return fail(
+          'pi-context-prune is active; context_prune is yielding to it to avoid double pruning. ' +
+            'Use context_tree_query to recall pruned originals.',
         );
-      },
-    });
-  }
+      }
+
+      const externalizedTo = (params.externalizedTo ?? '').trim();
+      if (!externalizedTo) {
+        return fail(
+          'externalizedTo is required: give the path where the original full outputs were saved ' +
+            '(this becomes part of the prune ledger and the recall ref).',
+        );
+      }
+      if (config.pruneRequireExistingFile && !existsSync(externalizedTo)) {
+        return fail(
+          `externalizedTo file not found: ${externalizedTo}. Write the original outputs there first, ` +
+            `then retry — a prune without a durable copy is not recoverable.`,
+        );
+      }
+
+      const now = Date.now();
+      const cooldownMs = config.pruneCooldownMinutes * 60_000;
+      if (
+        cooldownMs > 0 &&
+        state.lastPruneAt !== undefined &&
+        now - state.lastPruneAt < cooldownMs
+      ) {
+        const waitMin = Math.ceil((cooldownMs - (now - state.lastPruneAt)) / 60_000);
+        return fail(
+          `Prune cooldown: the last prune batch was ${formatClock(state.lastPruneAt)}. ` +
+            `Wait about ${waitMin} more minute(s).`,
+        );
+      }
+
+      const minChars = Math.max(0, Math.floor(params.minChars ?? config.pruneMinChars));
+      const quota = Math.max(1, Math.floor(config.pruneQuota));
+      const limit = Math.max(1, Math.min(quota, Math.floor(params.limit ?? quota)));
+
+      const allCandidates = selectCandidates(ctx, deps, _id, {
+        toolName: params.toolName,
+        minChars,
+      });
+
+      if (allCandidates.length === 0) {
+        return ok(
+          'No eligible tool results to prune: none older than the last compaction boundary meet the ' +
+            `size/age criteria (minChars ${minChars}).`,
+          { candidates: 0 },
+        );
+      }
+
+      if (params.targets && params.targets.length === 0) {
+        return ok(
+          'targets is an empty list — nothing selected. Omit targets entirely to auto-select ' +
+            'the largest eligible candidates, or pass entry ids from a dryRun listing.',
+          { selected: 0 },
+        );
+      }
+
+      let chosen = allCandidates.slice(0, limit);
+      if (params.targets && params.targets.length > 0) {
+        const byId = new Map(allCandidates.map((c) => [c.entryId, c]));
+        const selected: PruneCandidate[] = [];
+        const rejected: string[] = [];
+        for (const target of params.targets) {
+          const candidate = byId.get(target);
+          if (candidate) selected.push(candidate);
+          else rejected.push(target);
+        }
+        if (rejected.length > 0) {
+          return fail(
+            `Some targets are not eligible (unknown, too small, too recent, or already pruned): ` +
+              `${rejected.join(', ')}. Run context_prune with dryRun to list eligible entry ids.`,
+            { rejected },
+          );
+        }
+        chosen = selected.slice(0, limit);
+      }
+      const truncated = params.targets !== undefined && params.targets.length > chosen.length;
+
+      if (params.dryRun) {
+        const lines = chosen.map(
+          (c) => `- ${c.entryId} · ${formatTokens(c.chars / 4)} tokens (~${c.chars} chars) · ${c.toolName ?? 'tool'}`,
+        );
+        return ok(
+          `Dry run: ${chosen.length} eligible candidate(s), largest first:\n${lines.join('\n')}\n` +
+            (truncated
+              ? `Quota is ${quota} per call — ${params.targets?.length ?? limit} requested; the remainder stay for a later batch.\n`
+              : '') +
+            'Externalize them, then call context_prune with externalizedTo and optionally these entry ids.',
+          { dryRun: true, candidates: chosen.map((c) => ({ entryId: c.entryId, chars: c.chars })) },
+        );
+      }
+
+      const records: PruneRecord[] = chosen.map((c) => ({
+        ref: state.nextRef(),
+        entryId: c.entryId,
+        externalizedTo,
+        chars: c.chars,
+        toolName: c.toolName,
+      }));
+      state.addPruneRecords(records);
+      state.pendingPrune.push(...records);
+      state.lastPruneAt = now;
+
+      const refs = records.map((r) => r.ref).join(' ');
+      return ok(
+        `Scheduled ${records.length} tool result(s) for removal at the next turn boundary ` +
+          `(freed ~${formatTokens(records.reduce((s, r) => s + r.chars, 0) / 4)} tokens). ` +
+          (truncated
+            ? `Quota is ${quota} per call — the remaining ${params.targets!.length - records.length} eligible target(s) were NOT pruned; call again after the cooldown. `
+            : '') +
+          `Recall refs: ${refs} → ${externalizedTo}. Read that file if you need the originals.`,
+        {
+          pruned: records.map((r) => ({ ref: r.ref, entryId: r.entryId, chars: r.chars })),
+          externalizedTo,
+          truncated,
+        },
+      );
+    },
+  });
 }

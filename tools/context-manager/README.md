@@ -59,7 +59,9 @@ Compaction completed: 977K → 66K. Prior context is now a lossy summary; durabl
 - 参数：`instructions?`（聚焦摘要）、`keep?`（逐字保留的关键事实，总量 ≤ 窗口 5%）
 - keep-list 内容**显式全文**写入 `customInstructions`（pi 原生压缩把 tool result 截到 2000 字符才送摘要器，引用式保留会丢）
 - 护栏（description 与运行时同步声明/执行）：
-  - **idle-only**：已有压缩在途时拒绝；工具声明为 `executionMode: "sequential"`
+  - **idle-only**：已有压缩在途时拒绝；工具声明为 `executionMode: "sequential"`。在途标记复位分两层：
+    **确定性**复位在 `rebuildFromBranch()`（每次 `session_start`）——新会话不可能拥有上一个会话的在途压缩；
+    **兜底**是 10 分钟 TTL，覆盖同一会话内丢事件，避免工具被永久锁死
   - **冷却期**：距上次压缩 < 10 分钟拒绝（可配）
   - **低收益拒绝**：真实占用 < 50% 时拒绝并回真实用量
   - **缓存教导**：description 写明"仅在任务边界调用；每次压缩 = 一次缓存失效"
@@ -77,6 +79,11 @@ Compaction completed: 977K → 66K. Prior context is now a lossy summary; durabl
 > 实现注记（为何必须在 `agent_settled`）：工具里 `await ctx.compact()` 会死锁（run 等工具、`waitForIdle` 等 run）；
 > fire-and-forget 虽绕过死锁，但 abort 仍会打断回合。`agent_settled` 是首个 `_isAgentRunActive === false` 的时刻，
 > `ctx.compact()` 内部的 abort 变成 no-op，因此这是工具形态下唯一既不打断回合也不丢调用的调用点。
+>
+> **旧结论纠偏**：只记住“不能 await”会诱导出 fire-and-forget，而后者同样会打断回合——`abort()` 的效果（置
+> `_agentRunAbortRequested = true`、调用 `agent.abort()`）在它第一个 `await`（`waitForIdle`）之前已经**同步生效**，
+> 真正等不到返回的只是那个 async 函数本身。正确表述：**只要当前 run 仍在活动，任何形式的 `ctx.compact()` 调用
+> 都不安全，与是否 await 无关**。
 
 ### C. `context_prune`（定向删除，中风险）
 
@@ -87,6 +94,9 @@ Compaction completed: 977K → 66K. Prior context is now a lossy summary; durabl
   - **最小年龄**：候选必须**在当前保留窗口内**（entry 索引 ≥ 最近压缩的 `firstKeptEntryId`，否则已被摘要移除、
     裁剪无意义）**且早于最近一条 compaction entry**（即存活过至少一次压缩边界）；无 compaction 时退化为
     「至少早于最近 `pruneMinAgeTurns` 个 user 消息跨度」。压缩后新增的结果受保护，直到下一次压缩边界
+  - **边界返回值是「替换」语义**：pi 的边界事件把 handler 返回值**整体赋给** entries（`entries = result.entries`），
+    所以 `turn_end` / `agent_before_settle` 的返回值必须携带 `event.entries`，否则同一边界上其他扩展/其他 handler
+    的 `context_edit` 或消息草稿会被静默丢弃
   - 每次配额（默认 10 条）+ 冷却（30 分钟）
   - **`externalizedTo` 必填**，且默认要求该文件真实存在（无持久副本不可召回）
   - **召回 ref**：删除后注入 `[context-manager] Pruned N stale tool result(s) … Recall originals: t1→/tmp/x`，
@@ -95,7 +105,8 @@ Compaction completed: 977K → 66K. Prior context is now a lossy summary; durabl
 
 ### D. 护栏 hook + 审计 + 命令
 
-- `session_before_compact`：对 B 触发的压缩做最后防线（占用 < 50% cancel 并通知）
+- `session_before_compact`：对 B 触发的压缩做最后防线（占用 < 50% cancel 并通知）。只拦 `event.reason === 'manual'`
+  且由本扩展发起的那一次 —— pi 自己的 `threshold` / `overflow` 自动压缩不受影响
 - `session_compact` / `session_compact_failed`：记账（次数、时间、前后 token、失败原因）
 - `/context-manager` 命令：
   - `status`（默认）：当前用量 / 倒计时 / 账本 / 护栏配置 / 配置来源
@@ -166,9 +177,12 @@ Boot line / 里程碑 / `context_status` 里的 **soft-limit = `contextWindow - 
 
 ## 与 pi-context-prune 共存
 
-检测到 pi-context-prune 处于启用状态时，本扩展**不注册** `context_prune`（避免同名工具冲突与双重裁剪），
-`/context-manager status` 会提示让位。检测来源：`.pi/context-prune/settings.json` 与
+检测到 pi-context-prune 处于启用状态时，`context_prune` **运行期让位**（直接报错并指引用 `context_tree_query`），
+避免双重裁剪；`/context-manager status` 会提示让位。检测来源：`.pi/context-prune/settings.json` 与
 `~/.pi/agent/context-prune/settings.json` 的 `enabled`，或已注册的 `context_tree_query` 工具。
+
+工具**无条件注册**：加载期的检测只能看到「已经加载」的扩展，会与扩展加载顺序竞争（本该让位时仍注册、或本该注册时缺失）。
+检测改在 `session_start`、`context_status` 执行前、`/context-manager status` 时进行。
 
 ## 上下文预算
 

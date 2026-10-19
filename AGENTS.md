@@ -65,5 +65,16 @@ Tags follow `<extension-path>@<semver>` → `tools/context-manager@0.1.0`.
 regenerates the README catalog, commits, tags, and pushes. Version semantics: patch = fixes only;
 minor = new tools / backward-compatible features; major = tool renames or removals, breaking contracts.
 
+Two constraints of the script that shape the workflow:
+
+- **Dirty worktree aborts.** Preflight runs `git diff --quiet -- <extension-path>` and exits 1, so the
+  fix/docs commit must land *before* `release.sh`.
+- **Staging is `git add <extension-path> README.md`.** `docs/` and the root `package.json` are never
+  staged, so any change under `docs/` (e.g. `docs/context-manager-spec/CONSENSUS.md`) must be in its own
+  commit first — otherwise it stays in the worktree and the pushed docs keep the old wording.
+
+So a release is always two commits: the change commit (code + tests + `docs/`) and the release commit
+(`package.json` version bump only).
+
 Before releasing: `npm run typecheck` clean, `npm test` green, README updated, smoke test passes,
 and CI (`.github/workflows/ci.yml`) green.

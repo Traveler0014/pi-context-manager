@@ -98,6 +98,13 @@ export class ContextManagerState {
 
   /** Set while a context_compact call is in flight (idle-guard substitute + reentry guard). */
   compacting = false;
+  /** When the current compaction was requested; used by `isCompacting()`'s TTL. */
+  compactingSince: number | undefined;
+  /**
+   * A compaction that never reports back (lost event, reload, session switch)
+   * must not lock `context_compact` forever. Beyond this age the flag is stale.
+   */
+  static readonly COMPACTING_TTL_MS = 10 * 60_000;
   /** Set while a tool-initiated compaction awaits session_before_compact (last-defense guard). */
   pendingCompact = false;
   /**
@@ -162,8 +169,35 @@ export class ContextManagerState {
     this.lastCompactAt = at;
     this.lastCompactError = undefined;
     this.pendingCompact = false;
-    this.compacting = false;
+    this.clearCompacting();
     this.queuedCompact = undefined;
+  }
+
+  markCompacting(now = Date.now()): void {
+    this.compacting = true;
+    this.compactingSince = now;
+  }
+
+  clearCompacting(): void {
+    this.compacting = false;
+    this.compactingSince = undefined;
+  }
+
+  /**
+   * True only when a compaction is genuinely in flight. A flag older than
+   * COMPACTING_TTL_MS is treated as a lost event and cleared, so the tool
+   * cannot be locked out permanently by a single missed callback.
+   */
+  isCompacting(now = Date.now()): boolean {
+    if (!this.compacting) return false;
+    if (
+      this.compactingSince !== undefined &&
+      now - this.compactingSince < ContextManagerState.COMPACTING_TTL_MS
+    ) {
+      return true;
+    }
+    this.clearCompacting();
+    return false;
   }
 
   /** Rebuild persisted state from the session branch (called on session_start). */
@@ -172,6 +206,12 @@ export class ContextManagerState {
     this.pruneByEntry.clear();
     this.pendingPrune = [];
     this.queuedCompact = undefined;
+    // A new session cannot have a compaction in flight: whatever was pending
+    // belonged to the previous session/run. Clearing here is the deterministic
+    // half of the lock-out protection; `isCompacting()`'s TTL is the fallback
+    // for a lost event inside one session.
+    this.clearCompacting();
+    this.pendingCompact = false;
     this.refCounter = 0;
     this.lastPruneAt = undefined;
 

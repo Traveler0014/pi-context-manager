@@ -74,18 +74,25 @@ Compaction completed: 977K → 66K. Prior context is now a lossy summary; durabl
     > **实现澄清**：pi 的 `isIdle = !isAgentRunActive && !isCompacting`，而工具 `execute()` 必然运行在 agent run 内部，
     > 因此工具执行期 `ctx.isIdle()` 恒为 false。改用等效护栏：`state.compacting`（已有压缩在途）为 true 时拒绝并提示 "wait for idle"；
     > 同时把工具声明为 `executionMode: "sequential"`，避免与同批兄弟工具并发。
-    > `session_before_compact` 钩子仍按规格对 B 触发的压缩做占用 <50% 的 cancel 最后防线。
+    > `session_before_compact` 钩子仍按规格对 B 触发的压缩做占用 <50% 的 cancel 最后防线（仅 `reason === 'manual'`）；
+    > 在途标记复位分两层：**确定性**复位在 `rebuildFromBranch()`（每次 `session_start`）——新会话不可能拥有上一个会话的在途压缩，
+    > 无条件成立；**兜底**是 10 分钟 TTL，覆盖同一会话内丢事件，避免工具被永久锁死。
   - **冷却期**：距上次压缩 < 10 分钟拒绝（可配置）
   - **低收益拒绝**：真实占用 < 50% 时拒绝并回当前真实用量
   - **教导式 description**：写明"仅在任务边界（一批工作完成、报告已交付后）调用；勿连续调用；每次压缩 = 一次缓存失效"
 - 执行：工具只做护栏校验并**入队**（`state.queuedCompact`）；真正的 `ctx.compact({ customInstructions, onComplete })` 由
   `agent_settled` 处理器在当前 run 完全 settle 后发起，完成/失败由 `session_compact` / `session_compact_failed` 与锚定消息回报
   > **实现修订 v2（已实测，取代 fire-and-forget）**：pi 的 `ctx.compact()` 首行是 `await abort()`。从工具 `execute()` 里调用它，
-  > 即使不 await，abort 也已同步生效：当前 run 被中断，agent loop 在 `signal.aborted` 后直接 break——同一批中排在后面的
+  > 即使不 await，abort 的**效果**也已同步生效（置 `_agentRunAbortRequested = true` 并调用 `agent.abort()`；
+  > 只有那个 async 函数本身要等到 `waitForIdle()` 才返回）：当前 run 被中断，agent loop 在 `signal.aborted` 后直接 break——同一批中排在后面的
   > tool call 被**静默丢弃**（无 toolResult），并多出一条 `stopReason=error` 的 aborted assistant 消息；若压缩随后失败
   > （如 "Nothing to compact"），中断已经发生且不可撤销。因此改为**排队 + 延迟执行**：`agent_settled` 是首个
   > `_isAgentRunActive === false` 的时刻，此处的 `ctx.compact()` 内部 abort 为 no-op，既不打断回合也不丢调用。
   > 若 run 被用户 abort，则丢弃排队请求并提示；同一 run 内重复请求被拒绝。
+  >
+  > **旧结论纠偏**：早先那版“若在工具里 `await ctx.compact()` 会死锁”只解释了不可 await 的原因，容易被读成
+  > “别 await，fire-and-forget 就行”——而 fire-and-forget 同样会打断回合。正确结论是：**只要当前 run 仍在活动，
+  > 任何形式的 `ctx.compact()` 调用都不安全，与是否 await 无关**；唯一安全的调用点是 run 完全 settle 之后。
 
 ### C. `context_prune` 工具（定向删除，中风险带护栏）
 
@@ -99,11 +106,15 @@ Compaction completed: 977K → 66K. Prior context is now a lossy summary; durabl
   - 每次配额（默认 10 条）+ 冷却（30 分钟）
   - **`externalizedTo` 必填**：参数中必须给出"原文已外置到哪个文件"的路径，写入删除台账
   - **召回 ref**：删除后注入一行短别名（如 `pruned refs: t1 t2 t3 → /tmp/xxx, /tmp/yyy`），模型可随时引用——生态三位独立作者都做了删后可召回（context_tree_query / decompress / evidence recall），这是标配不是可选项
+  > **实现口径**：边界事件的返回值是**替换**语义（`entries = handlerResult.entries`），故 `turn_end` / `agent_before_settle`
+  > 必须把 `event.entries` 带上再追加自己的草稿，否则同一边界上先跑的 handler 产出的 `context_edit` 会被静默丢弃。
 - 若会话里装了 pi-context-prune，prune 动作要检测并让位（避免双重裁剪），status 行提示
+  > **实现口径**：工具**无条件注册**，让位只在运行期判定（加载期检测只能看到已加载的扩展，与加载顺序竞争）。
 
 ### D. 护栏 hook + 审计
 
-- `session_before_compact`：对 B 触发的压缩做最后防线（占用 < 50% cancel 并通知）
+- `session_before_compact`：对 B 触发的压缩做最后防线（占用 < 50% cancel 并通知）；只拦 `reason === 'manual'`
+  且由本扩展发起的那次，pi 自己的 `threshold` / `overflow` 自动压缩不受影响
 - `session_compact` / `session_compact_failed`：记账（次数、时间、触发方、前后 token、失败原因），供 A 的状态行和 `/context-manager` 命令展示
 - 注册 `/context-manager` 命令：status（当前用量/账本/护栏配置）、on/off、threshold 设置
 

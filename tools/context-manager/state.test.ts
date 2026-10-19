@@ -113,3 +113,18 @@ describe('queued compaction', () => {
     expect(state.queuedCompact).toBeUndefined();
   });
 });
+
+describe('session reset (D3a)', () => {
+  it('clears in-flight compaction flags when a new session starts', () => {
+    const state = new ContextManagerState({ ...DEFAULT_CONFIG });
+    state.markCompacting();
+    state.pendingCompact = true;
+    expect(state.isCompacting()).toBe(true);
+
+    // session_start → rebuildFromBranch: a different session cannot own our in-flight compaction.
+    state.rebuildFromBranch([]);
+    expect(state.compacting).toBe(false);
+    expect(state.pendingCompact).toBe(false);
+    expect(state.isCompacting()).toBe(false);
+  });
+});

@@ -33,7 +33,12 @@ describe('formatTokens', () => {
     expect(formatTokens(9_999)).toBe('10K');
     expect(formatTokens(10_000)).toBe('10K');
     expect(formatTokens(983_616)).toBe('984K');
-    expect(formatTokens(999_999)).toBe('1000K');
+  });
+
+  it('promotes the K/M boundary instead of printing 1000K', () => {
+    expect(formatTokens(999_499)).toBe('999K');
+    expect(formatTokens(999_500)).toBe('1M');
+    expect(formatTokens(999_999)).toBe('1M');
   });
 
   it('renders millions with an M suffix', () => {

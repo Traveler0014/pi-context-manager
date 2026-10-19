@@ -73,7 +73,7 @@ export default function contextManager(pi: ExtensionAPI) {
   const looseApi = pi as unknown as LooseApi;
   let state = new ContextManagerState({ ...DEFAULT_CONFIG });
   let configPath = 'defaults';
-  let pruneExtensionActive = detectPruneExtension(process.cwd(), pi);
+  let pruneExtensionActive = false;
 
   const reloadConfig = (cwd: string, ctx?: ExtensionContext): void => {
     const loaded = loadConfig(cwd);
@@ -85,6 +85,9 @@ export default function contextManager(pi: ExtensionAPI) {
   const deps = {
     state,
     isPruneExtensionActive: () => pruneExtensionActive,
+    refreshPruneDetection: (cwd: string) => {
+      pruneExtensionActive = detectPruneExtension(cwd, pi);
+    },
   };
 
   // ── config helpers ───────────────────────────────────────────────────────
@@ -221,8 +224,16 @@ export default function contextManager(pi: ExtensionAPI) {
 
   // ── boundary injection (prune edits + milestones) ────────────────────────
 
-  const boundaryFlush = (ctx: ExtensionContext): { entries: BoundaryEntry[] } | undefined => {
-    const entries: BoundaryEntry[] = [];
+  const boundaryFlush = (
+    ctx: ExtensionContext,
+    inherited: readonly BoundaryEntry[] = [],
+  ): { entries: BoundaryEntry[] } | undefined => {
+    // The boundary emitter REPLACES the entry list with whatever a handler
+    // returns: `entries = handlerResult.entries`. Handlers registered earlier on
+    // the same boundary (another extension, another handler) therefore must be
+    // carried forward here, or their context_edit / message drafts are silently
+    // dropped when we return ours.
+    const entries: BoundaryEntry[] = [...inherited];
 
     const prune = flushPendingPrune();
     if (prune) entries.push(...prune.entries);
@@ -240,7 +251,10 @@ export default function contextManager(pi: ExtensionAPI) {
       }
     }
 
-    return entries.length > 0 ? { entries } : undefined;
+    if (entries.length === 0) return undefined;
+    // Returning even an unchanged list is intentional: it preserves inherited
+    // drafts from handlers that ran earlier on this boundary.
+    return { entries };
   };
 
   // ── events ───────────────────────────────────────────────────────────────
@@ -287,9 +301,13 @@ export default function contextManager(pi: ExtensionAPI) {
     };
   });
 
-  looseApi.on('turn_end', async (_event: any, ctx: any) => boundaryFlush(ctx));
+  looseApi.on('turn_end', async (event: any, ctx: any) =>
+    boundaryFlush(ctx, event?.entries ?? []),
+  );
 
-  looseApi.on('agent_before_settle', async (_event: any, ctx: any) => boundaryFlush(ctx));
+  looseApi.on('agent_before_settle', async (event: any, ctx: any) =>
+    boundaryFlush(ctx, event?.entries ?? []),
+  );
 
   // ── deferred compaction (model-requested, executed once idle) ────────────
 
@@ -316,12 +334,12 @@ export default function contextManager(pi: ExtensionAPI) {
       state.clearQueuedCompaction();
       return Promise.resolve();
     }
-    if (state.compacting) return Promise.resolve();
+    if (state.isCompacting()) return Promise.resolve();
 
     const request = state.takeQueuedCompaction();
     if (!request) return Promise.resolve();
 
-    state.compacting = true;
+    state.markCompacting();
     state.pendingCompact = true;
     const ui = ctx.ui;
     const notify = (message: string, level: 'info' | 'warning' | 'error'): void => {
@@ -338,7 +356,7 @@ export default function contextManager(pi: ExtensionAPI) {
         pending = ctx.compact({
           customInstructions: request.instructions,
           onComplete: (result) => {
-            state.compacting = false;
+            state.clearCompacting();
             state.pendingCompact = false;
             state.lastCompactAt = Date.now();
             state.lastCompactError = undefined;
@@ -349,7 +367,7 @@ export default function contextManager(pi: ExtensionAPI) {
             resolve();
           },
           onError: (err) => {
-            state.compacting = false;
+            state.clearCompacting();
             state.pendingCompact = false;
             state.lastCompactError = err.message;
             notify(`context-manager: compaction failed — ${err.message}`, 'warning');
@@ -357,14 +375,16 @@ export default function contextManager(pi: ExtensionAPI) {
           },
         });
       } catch (err) {
-        state.compacting = false;
+        state.clearCompacting();
         state.pendingCompact = false;
         state.lastCompactError = err instanceof Error ? err.message : String(err);
         resolve();
         return;
       }
-      // Failure is already surfaced via onError / session_compact_failed; swallow
-      // the rejected fire-and-forget request so it never becomes unhandled.
+      // `ctx.compact` is typed void and returns undefined at runtime; failures are
+      // already surfaced via onError / session_compact_failed. Still guard against
+      // a thenable, so a future implementation that returns a rejected promise can
+      // never become an unhandled rejection.
       Promise.resolve(pending).catch(() => resolve());
     });
   };
@@ -383,8 +403,14 @@ export default function contextManager(pi: ExtensionAPI) {
     await runQueuedCompaction(ctx);
   });
 
-  pi.on('session_before_compact', async (_event, ctx) => {
-    if (!state.config.enabled || !state.pendingCompact) return undefined;
+  pi.on('session_before_compact', async (event, ctx) => {
+    // Only veto a compaction THIS tool requested. pi also compacts on its own
+    // (reason "threshold" / "overflow"); cancelling those because our low-yield
+    // guard applies would abort an unrelated, necessary auto-compaction — and
+    // reporting it as "context_compact cancelled" in the TUI is misleading.
+    if (event.reason !== 'manual' || !state.config.enabled || !state.pendingCompact) {
+      return undefined;
+    }
     const usage = ctx.getContextUsage();
     if (!usage || usage.tokens === null) return undefined;
     const capacity = usage.contextWindow;
@@ -427,7 +453,7 @@ export default function contextManager(pi: ExtensionAPI) {
 
   looseApi.on('session_compact_failed', async (event: any, ctx: any) => {
     state.pendingCompact = false;
-    state.compacting = false;
+    state.clearCompacting();
     state.lastCompactError = event.errorMessage ?? (event.aborted ? 'aborted or cancelled' : 'unknown');
     if (isTui(ctx) && event.errorMessage) {
       ctx.ui.notify(`Compaction failed: ${event.errorMessage}`, 'warning');
