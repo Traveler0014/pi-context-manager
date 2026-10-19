@@ -282,3 +282,49 @@ describe('B deferred compaction', () => {
     expect((await pi.callTool('context_compact', {}, ctx)).isError).toBeFalsy();
   });
 });
+
+// ── stale ctx: teardown reports through an invalidated ctx ─────────────────
+//
+// `dispose()` aborts compaction and only *then* invalidates the extension
+// runner (agent-session.js: `abortCompaction()` … `invalidate()`), while
+// `compact()`'s catch awaits `_emitSessionCompactFailed(...)` afterwards. So a
+// compaction that fails during session replacement/quit is reported through an
+// already-invalidated ctx. `runner.createContext()` itself does not throw —
+// `mode`/`ui` are getters that call `assertActive()` — so the protection must be
+// narrowed to reading `mode`, not wrap the whole handler: the state cleanup in
+// that handler still has to run in the invalid window.
+
+describe('stale ctx', () => {
+  const STALE = 'This extension ctx is stale after session replacement or reload.';
+
+  function staleCtx(): any {
+    return {
+      get mode(): string {
+        throw new Error(STALE);
+      },
+      get ui(): unknown {
+        throw new Error(STALE);
+      },
+    };
+  }
+
+  it('session_compact_failed tolerates a ctx invalidated by teardown', async () => {
+    const pi = makePi();
+    const ctx = makeCtx();
+    await boot(pi, ctx);
+
+    await expect(
+      pi.emit(
+        'session_compact_failed',
+        { type: 'session_compact_failed', errorMessage: 'Compaction cancelled', aborted: true },
+        staleCtx(),
+      ),
+    ).resolves.toBeUndefined();
+  });
+
+  // `session_shutdown` deliberately has no such guard: pi always emits it BEFORE
+  // invalidating the runner (agent-session-runtime.js:106-112 for quit,
+  // :297-302 for the other teardown, agent-session.js:2972-2973 for reload), so
+  // `ctx.mode` is valid there. Adding `isTui()` would hide a real ordering
+  // regression instead of surfacing it.
+});
